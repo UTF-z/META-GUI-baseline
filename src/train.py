@@ -113,27 +113,29 @@ def cache_train_dataset(args, config):
 
 def train(args, model, config):
     # dataset = cache_train_dataset(args, config)
-    epoch_iter = tqdm(range(args.epoch), desc="epoch")
+    epoch_iter = tqdm(range(args.epoch), desc="epoch") # 获得一个进度条迭代器
     num_iter = 0
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-    scheduler = StepLR(optimizer, step_size=1, gamma=0.9)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # 指明设备
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate) # 获得Adam优化器, 提供学习率
+    scheduler = StepLR(optimizer, step_size=1, gamma=0.9) # 获取scheduler, 作用是在每step_size个step后将学习率乘以gamma
     model.to(device)
-    for _ in epoch_iter:
+    for _ in epoch_iter: # 开始一个epoch
         # random.shuffle(dataset)
         if args.model_type == "action":
-            dataloader = action_data_loader(args.batch_size, args.train_file, config)
+            dataloader = action_data_loader(args.batch_size, args.train_file, config) # batch size = 1
         else:
             dataloader = reply_data_loader(args.batch_size, args.train_file, config)
-        batch_iter = tqdm(dataloader, desc="iteration")
+        batch_iter = tqdm(dataloader, desc="iteration") # 一个epoch中过一遍这个dataloader
         # batch_iter = tqdm(dataset, desc="iteration")
         for batch in batch_iter:
-            model.train()
+            model.train() # 模型设置train模式
             start_time = time.time()
             if args.model_type == "action":
                 if not config.multi_modal:
+                    # 取出batch
                     input_ids, attention_masks, token_type_ids, bbox_s, item_matrixes, actions, starts, ends, \
                     target_items, directions = batch
+                    # 设置device
                     input_ids = input_ids.to(device)
                     attention_masks = attention_masks.to(device)
                     token_type_ids = token_type_ids.to(device)
@@ -144,10 +146,12 @@ def train(args, model, config):
                     ends = ends.to(device)
                     target_items = target_items.to(device)
                     directions = directions.to(device)
+                    # 算loss
                     loss, action_loss, text_loss, item_loss, direction_loss, _, _, _, _, _ = \
                         model(input_ids, bbox_s, attention_masks, token_type_ids, item_matrixes, actions,
                               starts, ends, target_items, directions)
                 else:
+                    # 多模态的话有图像信息
                     input_ids, image, attention_masks, token_type_ids, bbox_s, item_matrixes, actions, starts, ends, \
                     target_items, directions = batch
                     input_ids = input_ids.to(device)
@@ -166,6 +170,7 @@ def train(args, model, config):
                               starts, ends, target_items, directions)
                 num_iter += 1
                 loss = loss / args.gradient_accumulation_steps
+                print(f'DEBUG: {loss.item()}')
                 with torch.autograd.detect_anomaly():
                     loss.backward()
                 """
@@ -182,6 +187,7 @@ def train(args, model, config):
                 end_time = time.time()
                 batch_iter.set_description(desc="iter: %d, loss: %.4f, time: %.4f" % (num_iter, loss.item(),
                                                                                       end_time - start_time))
+                # 注意, 由于batch size只能为1, 为了稳定训练, 手动每n步step一次
                 if num_iter % args.gradient_accumulation_steps == 0:
                     nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                     optimizer.step()
@@ -209,6 +215,7 @@ def train(args, model, config):
                     loss = model(input_ids, image, bbox_s, attention_masks, token_type_ids, reply_texts)
                 num_iter += 1
                 loss = loss / args.gradient_accumulation_steps
+                print(f'DEBUG: {loss.item()}')
                 with torch.autograd.detect_anomaly():
                     loss.backward()
                 # writer.add_scalar("loss", loss.item(), global_step=num_iter)
@@ -220,6 +227,7 @@ def train(args, model, config):
                     optimizer.step()
                     optimizer.zero_grad()
 
+        # 每个epoch结束了, scheduler step一次
         scheduler.step()
 
 
@@ -257,7 +265,7 @@ def evaluate(args, model, config):
     tokenizer = AutoTokenizer.from_pretrained(config.encoder_model_type)
 
     for batch in batch_iter:
-        model.eval()
+        model.eval() # 注意设置为eval模式
         if args.model_type == "action":
             if not config.multi_modal:
                 id_info, input_ids, attention_masks, token_type_ids, bbox_s, item_matrixes, actions, starts, ends, \
@@ -335,6 +343,7 @@ def evaluate(args, model, config):
             word_pred.append(decoded_words)
 
     if args.model_type == "action":
+        # 计算action acc
         action_accuracy = np.sum(np.array(action_target) == np.array(action_pred)) / len(action_target)
         turn_completions = {}
         turn_action_completions = {}
@@ -448,6 +457,7 @@ def evaluate(args, model, config):
                 else:
                     turn_completions[turn_path] = [0]
 
+        # 计算所有start和end的准确率
         cnt = 0
         start_cnt = 0
         end_cnt = 0
@@ -462,9 +472,9 @@ def evaluate(args, model, config):
         start_accuracy = start_cnt / cnt
         end_accuracy = end_cnt / cnt
 
+        # 计算所有typing 文本的exact match以及f1 score
         typing_em = []
         typing_f1 = []
-
         for i in range(len(action_target)):
             if action_target[i] == 1:
                 typing_content_string = tokenizer.decode(typing_content[i], skip_special_tokens=True)
@@ -473,6 +483,7 @@ def evaluate(args, model, config):
                 typing_em.append(compute_exact(typing_content_string, typing_content_pred_string))
                 typing_f1.append(compute_f1(typing_content_string, typing_content_pred_string))
 
+        # 计算item acc
         cnt = 0
         item_cnt = 0
         for i in range(len(item_target)):
@@ -483,6 +494,7 @@ def evaluate(args, model, config):
                 item_cnt += 1
         item_accuracy = item_cnt / cnt
 
+        # 计算direction acc
         cnt = 0
         direction_cnt = 0
         for i in range(len(direction_target)):
@@ -493,6 +505,7 @@ def evaluate(args, model, config):
                 direction_cnt += 1
         direction_accuracy = direction_cnt / cnt
 
+        # 计算turn完成率, 只有当前turn中每一步action type以及对应的参数都正确, 那么才认为这个turn complete
         turn_complete = []
         turn_keys = list(turn_completions.keys())
         for key in turn_keys:
@@ -503,15 +516,15 @@ def evaluate(args, model, config):
                 turn_complete.append(0)
 
         result = {
-            "action_accuracy": action_accuracy,
-            "start_accuracy": start_accuracy,
-            "end_accuracy": end_accuracy,
-            "typing_em": sum(typing_em) / len(typing_em),
-            "typing_f1": sum(typing_f1) / len(typing_f1),
-            "item_accuracy": item_accuracy,
-            "direction_accuracy": direction_accuracy,
-            "action_completion": sum(action_completion) / len(action_completion),
-            "turn_completion": sum(turn_complete) / len(turn_complete)
+            "action_accuracy": action_accuracy, # 动作类别准确率
+            "start_accuracy": start_accuracy, # start 准确率
+            "end_accuracy": end_accuracy, # end 准确率
+            "typing_em": sum(typing_em) / len(typing_em), # typing 内容的em
+            "typing_f1": sum(typing_f1) / len(typing_f1), # typing 内容的f1
+            "item_accuracy": item_accuracy, # item 准确率
+            "direction_accuracy": direction_accuracy, # direction 准确率
+            "action_completion": sum(action_completion) / len(action_completion), # 动作完成率, 只有动作类别和参数都匹配才算完成
+            "turn_completion": sum(turn_complete) / len(turn_complete) # turn 完成率, 只有当前turn中每一步action type以及对应的参数都正确, 那么才认为这个turn complete
         }
         analysis_res = {
             "action": {
@@ -531,12 +544,15 @@ def evaluate(args, model, config):
         with open(os.path.join(args.save_path, "analysis_result.json"), 'w') as file:
             json.dump(analysis_res, file, indent=1)
 
+    # 如果是 response model
     else:
         pred_text = []
         word_belu = []
         for i in range(len(word_target)):
+            # 跳过空字符串
             if word_target[i][0] == config.cls_token_id and word_target[i][1] == config.sep_token_id:
                 continue
+            # 将两个text先decode出来, 然后计算bleu score
             reply_text = tokenizer.decode(word_target[i], skip_special_tokens=True)
             reply_text_pred = tokenizer.decode(word_pred[i], skip_special_tokens=True)
             word_belu.append(corpus_bleu([[reply_text.split(" ")]], [reply_text_pred.split(" ")]))
@@ -621,8 +637,8 @@ def main():
             layout_model.resize_token_embeddings(encoder_model_config.vocab_size + 7)
         model.encoder_model.load_state_dict(layout_model.state_dict())
 
-    print(args)
-    print(config)
+    # print(args)
+    # print(config)
 
     if args.train:
         train(args, model, config)

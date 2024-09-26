@@ -157,8 +157,7 @@ class ResponseModel(nn.Module):
                                                        token_type_ids=token_type_ids)
         encoder_hidden_states = encoder_hidden_states.last_hidden_state
         decoder_input_ids = shift_tokens_right(reply_text, 0)
-        tgt_mask = torch.triu(torch.ones((reply_seq_length, reply_seq_length), device=device)).transpose(0, 1)
-        tgt_mask = (1.0 - tgt_mask) * -10000.0
+        tgt_mask = torch.triu(torch.ones((reply_seq_length, reply_seq_length), device=device), diagonal=1) * -10000.0
         reply_pred = self.reply_text_decoder(decoder_input_ids.transpose(0, 1),
                                              encoder_hidden_states.transpose(0, 1),
                                              tgt_mask, attention_mask).transpose(0, 1).contiguous()
@@ -272,6 +271,7 @@ class ActionModel(nn.Module):
         action_pred = self.action_type_classifier(pooled_outputs)
         if actions is not None:
             action_loss = F.cross_entropy(action_pred, actions)
+            print(f'action: {action_loss.item()}')
 
         action_index = torch.argmax(action_pred, dim=-1).squeeze()
 
@@ -287,6 +287,8 @@ class ActionModel(nn.Module):
                 ends = ends.squeeze(-1)
             starts_loss = F.cross_entropy(starts_pred, starts, ignore_index=-100)
             ends_loss = F.cross_entropy(ends_pred, ends, ignore_index=-100)
+            print(f'start: {starts_loss.item()}')
+            print(f'end: {ends_loss.item()}')
 
         start_index = torch.argmax(starts_pred, dim=-1).squeeze()
         end_index = torch.argmax(ends_pred, dim=-1).squeeze()
@@ -307,6 +309,7 @@ class ActionModel(nn.Module):
 
         if directions is not None:
             direction_loss = F.cross_entropy(direction_pred, directions, ignore_index=-100)
+            print(f'direct: {direction_loss}')
 
         direction_index = torch.argmax(direction_pred, dim=-1).squeeze()
 
@@ -351,7 +354,7 @@ class AttentionBlock(nn.Module):
         output = self.dropout(output)
         output = self.LayerNorm(output + inputs)
 
-        extended_attention_mask = attention_mask[:, None, None, :]
+        extended_attention_mask = attention_mask[:, None, None, :] # [1, seq_len] => [1, 1(num_head), 1(will_broadcast), seq_len]
         extended_attention_mask = extended_attention_mask.to(dtype=self.dense.weight.dtype)
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
         output = self.attention(output, attention_mask=extended_attention_mask)[0]
@@ -709,7 +712,7 @@ class MultiModalResponseModelWithHistory(nn.Module):
 
         self.box_roi_pool = MultiScaleRoIAlign(
             featmap_names=['0', '1', '2', '3'],
-            output_size=7,
+            output_size=7, # 指定了包围盒输出特征尺寸为7*7
             sampling_ratio=2)
 
         out_channels = self.backbone.out_channels
@@ -720,12 +723,32 @@ class MultiModalResponseModelWithHistory(nn.Module):
             representation_size)
 
     def resnet_fpn_forward(self, image, page_box):
-        images = [image.squeeze(0)]
-        page_boxs = page_box * 224 / 1000
-        page_boxs = [page_boxs.squeeze(0)]
-        outputs, _ = self.transform(images)
-        features = self.backbone(outputs.tensors)
+        images = [image.squeeze(0)] # Tensor(1, 3, 224, 224) => [Tensor(3, 224, 224)]
+        page_boxs = page_box * 224 / 1000 # each box has resolution 1000*1000, now 224 * 224
+        page_boxs = [page_boxs.squeeze(0)] # Tensor(1, seq_len, 4) => [Tensor(seq_len, 4)]
+        outputs, _ = self.transform(images) # 减去均值, 除以方差, 再进行resize, 这里resize没起作用, 因为本来就是224*224
+        '''
+        生成特征金字塔, 输入是[1, 3, 224, 224], 输出是一个OrderedList
+        {
+            '0': Tensor(1, 256, 56, 56),
+            '1': Tensor(1, 256, 28, 28),
+            '2': Tensor(1, 256, 14, 14),
+            '3': Tensor(1, 256, 7, 7),
+            'pool': Tensor(1, 256, 4, 4)
+        }
+        '''
+        features = self.backbone(outputs.tensors) 
+        '''
+        根据特征金字塔, 包围盒, 以及原图大小, 生成每个包围盒的ROI特征
+        输入特征金字塔如上, 通道数为256
+        包围盒[Tensor(seq_len, 4)]
+        输出为Tensor(seq_len, 256, 7, 7)
+        '''
         box_features = self.box_roi_pool(features, page_boxs, outputs.image_sizes)
+        '''
+        将每个包围盒特征faltten并且重新映射
+        输出为Tensor(1, seq_len, 768)
+        '''
         box_features = self.box_head(box_features).unsqueeze(0)
 
         return box_features
@@ -784,9 +807,9 @@ class MultiModalResponseModelWithHistory(nn.Module):
 
             if history_length != 1:
                 if history_length == 2:
-                    image_outputs_his = self.resnet_fpn_forward(image[0].unsqueeze(0), page_bbox)
-                    image_outputs_cur = self.resnet_fpn_forward(image[1].unsqueeze(0), page_bbox)
-                    image_outputs = self.attention_compose(image_outputs_his, image_outputs_cur)
+                    image_outputs_his = self.resnet_fpn_forward(image[0].unsqueeze(0), page_bbox) # 为每个包围盒生成一个ROI特征, Tensor(1, seq_len, 768[config.hidden_size])
+                    image_outputs_cur = self.resnet_fpn_forward(image[1].unsqueeze(0), page_bbox) # BUG: 不同的图片却使用了相同的bbox
+                    image_outputs = self.attention_compose(image_outputs_his, image_outputs_cur) # cur 作为q, his作为k, v, 做一次attention计算
                 elif history_length == 3:
                     image_outputs_his1 = self.resnet_fpn_forward(image[0].unsqueeze(0), page_bbox)
                     image_outputs_his2 = self.resnet_fpn_forward(image[1].unsqueeze(0), page_bbox)
@@ -797,7 +820,7 @@ class MultiModalResponseModelWithHistory(nn.Module):
                 image_outputs = self.resnet_fpn_forward(image, page_bbox)
 
             for i, layer in enumerate(self.struc):
-                encoder_outputs = layer(encoder_outputs, image_outputs, attention_mask=attention_mask)
+                encoder_outputs = layer(encoder_outputs, image_outputs, attention_mask=attention_mask) # cat 图像和文本feature, self-attention
 
         decoder_input_ids = shift_tokens_right(reply_text, 0)
         tgt_mask = torch.triu(torch.ones((reply_seq_length, reply_seq_length), device=device)).transpose(0, 1)
